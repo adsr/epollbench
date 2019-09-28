@@ -11,28 +11,9 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/syscall.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
-
-int opt_port = 1234;
-int opt_backlog = 256;
-int opt_num_worker_threads = 4;
-int opt_num_accept_threads = 0;
-int opt_epoll_nevents = 256;
-int opt_epoll_timeout_ms = 1000;
-int opt_epoll_per_worker = 0;
-int opt_spinlock = 1;
-int opt_soreuseport = 1;
-int opt_epollexclusive = 1;
-int opt_read_size = 256;
-int opt_max_clients = 1024;
-// TODO epolloneshot?
-// TODO epollet?
-
-int stat_client_accept = 0;
-int stat_client_reject = 0;
-int stat_spurious_accept = 0;
-int stat_epoll_del_fail = 0;
 
 typedef struct _buf_t buf_t;
 typedef struct _client_t client_t;
@@ -55,6 +36,7 @@ struct _client_t {
     size_t wbuf_cursor;
     int is_writing_to;
     int alive;
+    client_t *next;
 };
 
 void join_threads();
@@ -71,7 +53,30 @@ void add_client(int sockfd, int lepfd);
 void handle_client(client_t *client, uint32_t events);
 void kill_client(client_t *client);
 void free_clients();
+void setup_clients();
+void lock_client_list();
+void unlock_client_list();
 void parse_opts(int argc, char **argv);
+
+int opt_port = 1234;
+int opt_backlog = 256;
+int opt_num_worker_threads = 4;
+int opt_num_accept_threads = 0;
+int opt_epoll_nevents = 256;
+int opt_epoll_timeout_ms = 1000;
+int opt_epoll_per_worker = 0;
+int opt_spinlock = 1;
+int opt_soreuseport = 1;
+int opt_epollexclusive = 1;
+int opt_read_size = 256;
+int opt_max_clients = 1024;
+// TODO epolloneshot?
+// TODO epollet?
+
+int stat_client_accept = 0;
+int stat_client_reject = 0;
+int stat_spurious_accept = 0;
+int stat_epoll_del_fail = 0;
 
 int listenfd = -1;
 int *listenfdp = NULL;
@@ -81,9 +86,12 @@ pthread_t *worker_threads = NULL;
 pthread_t *accept_threads = NULL;
 int *worker_epfds = NULL;
 client_t *clients;
+client_t *free_client_list;
+pthread_spinlock_t client_list_spinlock;
+pthread_mutex_t client_list_mutex;
 
 #define die(pwhat) \
-    do { fprintf(stderr, "%s: %s: %s\n", __func__, (pwhat), strerror(errno)); exit(1); } while(0)
+    do { fprintf(stderr, "(tid=%ld) %s: %s: %s\n", syscall(__NR_gettid), __func__, (pwhat), strerror(errno)); exit(1); } while(0)
 
 #define stat_incr(pstat) \
     do { __sync_fetch_and_add(&(pstat), 1); } while(0)
@@ -91,7 +99,7 @@ client_t *clients;
 int main(int argc, char **argv) {
     parse_opts(argc, argv);
 
-    clients = calloc(opt_max_clients, sizeof(client_t));
+    setup_clients();
     setup_epoll();
     setup_listener();
     setup_threads();
@@ -100,7 +108,6 @@ int main(int argc, char **argv) {
     close(listenfd);
     free_clients();
     close_epolls();
-    free(clients);
 
     return 0;
 }
@@ -228,9 +235,12 @@ void *worker_main(void *arg) {
     int lepfd, rv, i;
     void *ptr;
     struct epoll_event *events;
+    size_t worker_num;
+
+    worker_num = (size_t)arg;
 
     if (opt_epoll_per_worker) {
-        lepfd = worker_epfds[(size_t)arg];
+        lepfd = worker_epfds[worker_num];
     } else {
         lepfd = epfd;
     }
@@ -245,8 +255,10 @@ void *worker_main(void *arg) {
         for (i = 0; i < rv; i++) {
             ptr = events[i].data.ptr;
             if (ptr == listenfdp) {
+fprintf(stderr, "(tid=%ld) %s: epoll_wait events=%d accept\n", syscall(__NR_gettid), __func__, events[i].events);
                 do_accept(lepfd);
             } else {
+fprintf(stderr, "(tid=%ld) %s: epoll_wait events=%d client=%p\n", syscall(__NR_gettid), __func__, events[i].events, ptr);
                 lock_client(ptr);
                 handle_client(ptr, events[i].events);
                 unlock_client(ptr);
@@ -277,13 +289,12 @@ void *accept_main(void *arg) {
     struct timeval timeout;
     int rv, worker_num, lepfd;
 
-    timeout.tv_sec = 1;
-    timeout.tv_usec = 0;
-
     (void)arg;
     while (!done) {
         FD_ZERO(&readfds);
         FD_SET(listenfd, &readfds);
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
 
         rv = select(listenfd + 1, &readfds, NULL, NULL, &timeout);
 
@@ -338,18 +349,17 @@ void do_accept(int lepfd) {
 }
 
 void add_client(int sockfd, int lepfd) {
-    int i;
     client_t *client;
     struct epoll_event epe;
 
-    /* Find free client */
+    /* Get client from free list */
     client = NULL;
-    for (i = 0; i < opt_max_clients; i++) {
-        if (!clients[i].alive) {
-            client = clients + i;
-            break;
-        }
+    lock_client_list();
+    if (free_client_list != NULL) {
+        client = free_client_list;
+        free_client_list = free_client_list->next;
     }
+    unlock_client_list();
 
     /* Reject if unable to find */
     if (!client) {
@@ -399,6 +409,10 @@ void handle_client(client_t *client, uint32_t events) {
     }
 
     if (client->is_writing_to) {
+        if (events & EPOLLERR) {
+            kill_client(client);
+            return;
+        }
         if (!(events & EPOLLOUT)) {
             return;
         }
@@ -421,10 +435,14 @@ void handle_client(client_t *client, uint32_t events) {
         }
         client->is_writing_to = 0;
     } else {
+        if (events & EPOLLRDHUP || events & EPOLLERR || events & EPOLLHUP) {
+            kill_client(client);
+            return;
+        }
         if (!(events & EPOLLIN)) {
             return;
         }
-        while (client->rbuf_wanted_len == 0 || client->rbuf_wanted_len < client->rbuf.len) {
+        while (client->rbuf_wanted_len == 0 || client->rbuf.len < client->rbuf_wanted_len) {
             /* Ensure memory in rbuf */
             if (client->rbuf.len + opt_read_size > client->rbuf.cap) {
                 client->rbuf.cap = client->rbuf.len + opt_read_size;
@@ -446,6 +464,7 @@ void handle_client(client_t *client, uint32_t events) {
                 }
             } else if (rv == 0) {
                 kill_client(client);
+                return;
             } else {
                 client->rbuf.len += rv;
                 if (client->rbuf_wanted_len == 0 && client->rbuf.len >= sizeof(uint32_t)) {
@@ -462,30 +481,37 @@ void handle_client(client_t *client, uint32_t events) {
             return;
         }
 
-        /* Echo rbuf to wbuf */
+        /* Ensure cap in wbuf */
         if (client->rbuf.len > client->wbuf.cap) {
             client->wbuf.cap = client->rbuf.len;
             client->wbuf.buf = realloc(client->wbuf.buf, client->wbuf.cap);
             if (!client->wbuf.buf) {
                 die("realloc wbuf");
             }
-            memcpy(client->wbuf.buf, client->rbuf.buf, client->rbuf.len);
-            client->wbuf.len = client->rbuf.len;
-            client->wbuf_cursor = 0;
         }
+
+        /* Echo rbuf to wbuf */
+        memcpy(client->wbuf.buf, client->rbuf.buf, client->rbuf.len);
+        client->wbuf.len = client->rbuf.len;
+        client->wbuf_cursor = 0;
+
         client->rbuf.len = 0;
+        client->rbuf_wanted_len = 0;
         client->is_writing_to = 1;
         handle_client(client, events | EPOLLOUT);
     }
 }
 
 void kill_client(client_t *client) {
+
     client->alive = 0;
     client->rbuf.len = 0;
     client->wbuf.len = 0;
     client->rbuf_wanted_len = 0;
     client->wbuf_cursor = 0;
     client->is_writing_to = 0;
+
+    fprintf(stderr, "(tid=%ld) %s: client=%p\n", syscall(__NR_gettid),  __func__, (void*)client);
 
     if (epoll_ctl(client->lepfd, EPOLL_CTL_DEL, client->sockfd, NULL) < 0) {
         fprintf(stderr, "kill_client: epoll_ctl: %s\n", strerror(errno));
@@ -495,6 +521,12 @@ void kill_client(client_t *client) {
 
     client->lepfd = -1;
     client->sockfd = -1;
+
+    /* Put client back in free list */
+    lock_client_list();
+    client->next = free_client_list;
+    free_client_list = client;
+    unlock_client_list();
 }
 
 void free_clients() {
@@ -507,6 +539,41 @@ void free_clients() {
         }
         if (client->rbuf.buf) free(client->rbuf.buf);
         if (client->wbuf.buf) free(client->wbuf.buf);
+    }
+    free(clients);
+}
+
+void setup_clients() {
+    int i;
+    clients = calloc(opt_max_clients, sizeof(client_t));
+    for (i = 0; i < opt_max_clients - 1; i++) {
+        clients[i].next = clients + i + 1;
+    }
+    free_client_list = clients;
+    if (opt_spinlock) {
+        if ((errno = pthread_spin_init(&client_list_spinlock, PTHREAD_PROCESS_SHARED)) != 0) {
+            die("pthread_spin_init");
+        }
+    } else {
+        if ((errno = pthread_mutex_init(&client_list_mutex, NULL)) != 0) {
+            die("pthread_mutex_init");
+        }
+    }
+}
+
+void lock_client_list() {
+    if (opt_spinlock) {
+        pthread_spin_lock(&client_list_spinlock);
+    } else {
+        pthread_mutex_lock(&client_list_mutex);
+    }
+}
+
+void unlock_client_list() {
+    if (opt_spinlock) {
+        pthread_spin_unlock(&client_list_spinlock);
+    } else {
+        pthread_mutex_unlock(&client_list_mutex);
     }
 }
 

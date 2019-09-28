@@ -1,5 +1,5 @@
 epollbench_cflags:=-std=c99 -Wall -Wextra -pedantic -g -O0 $(CFLAGS)
-epollbench_libs:=-pthread $(LDLIBS)
+epollbench_libs:=-pthread -lm $(LDLIBS)
 
 all: epollbench epollbench_client
 
