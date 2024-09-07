@@ -213,20 +213,21 @@ void setup_listener() {
         die("listen");
     }
 
-    listenfdp = &listenfd;
-
-    /* Add listenfd to epollfd(s) */
-    epe.events = EPOLLIN | EPOLLOUT | EPOLLET;
-    epe.data.ptr = listenfdp;
-    if (opt_epoll_per_worker) {
-        for (i = 0; i < opt_num_worker_threads; i++) {
-            if (epoll_ctl(*(worker_epfds + i), EPOLL_CTL_ADD, listenfd, &epe) < 0) {
+    if (opt_num_accept_threads <= 0) {
+        /* Add listenfd to epollfd(s) */
+        listenfdp = &listenfd;
+        epe.events = EPOLLIN | EPOLLOUT | EPOLLET;
+        epe.data.ptr = listenfdp;
+        if (opt_epoll_per_worker) {
+            for (i = 0; i < opt_num_worker_threads; i++) {
+                if (epoll_ctl(*(worker_epfds + i), EPOLL_CTL_ADD, listenfd, &epe) < 0) {
+                    die("epoll_ctl");
+                }
+            }
+        } else {
+            if (epoll_ctl(epfd, EPOLL_CTL_ADD, listenfd, &epe) < 0) {
                 die("epoll_ctl");
             }
-        }
-    } else {
-        if (epoll_ctl(epfd, EPOLL_CTL_ADD, listenfd, &epe) < 0) {
-            die("epoll_ctl");
         }
     }
 }
@@ -255,10 +256,10 @@ void *worker_main(void *arg) {
         for (i = 0; i < rv; i++) {
             ptr = events[i].data.ptr;
             if (ptr == listenfdp) {
-fprintf(stderr, "(tid=%ld) %s: epoll_wait events=%d accept\n", syscall(__NR_gettid), __func__, events[i].events);
+                fprintf(stderr, "(tid=%ld) %s: epoll_wait events=%d accept\n", syscall(__NR_gettid), __func__, events[i].events);
                 do_accept(lepfd);
             } else {
-fprintf(stderr, "(tid=%ld) %s: epoll_wait events=%d client=%p\n", syscall(__NR_gettid), __func__, events[i].events, ptr);
+                fprintf(stderr, "(tid=%ld) %s: epoll_wait events=%d client=%p\n", syscall(__NR_gettid), __func__, events[i].events, ptr);
                 lock_client(ptr);
                 handle_client(ptr, events[i].events);
                 unlock_client(ptr);
@@ -314,6 +315,7 @@ void *accept_main(void *arg) {
             }
 
             /* Accept client */
+            fprintf(stderr, "(tid=%ld) %s: select accept\n", syscall(__NR_gettid), __func__);
             do_accept(lepfd);
         }
     }

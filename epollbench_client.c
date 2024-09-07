@@ -18,12 +18,11 @@
 
 int opt_port = 1234;
 char *opt_host_ip = "127.0.0.1";
-int opt_num_worker_threads = 1000;
-int opt_num_messages = 10000000;
+int opt_num_worker_threads = 512;
+int opt_num_messages = 16384;
 int opt_max_payload_len = 16384;
 unsigned int opt_rand_seed = 0;
 unsigned int opt_rw_chunk_size = 32;
-
 
 void setup_threads();
 void join_threads();
@@ -175,6 +174,8 @@ void *worker_main(void *arg) {
                 /* Done (read failure) */
                 fprintf(stderr, "%s: memcmp: %s\n", __func__, "Payload mismatch");
                 goto worker_main_done;
+            } else {
+                fprintf(stderr, "%s: memcmp: %s\n", __func__, "Payload match!");
             }
         }
 
