@@ -154,7 +154,7 @@ void setup_threads() {
     if (opt_num_accept_threads > 0) {
         accept_threads = calloc(opt_num_accept_threads, sizeof(pthread_t));
         for (i = 0; i < (size_t)opt_num_accept_threads; i++) {
-            if ((errno = pthread_create(accept_threads + i, NULL, accept_main, NULL)) != 0) {
+            if ((errno = pthread_create(accept_threads + i, NULL, accept_main, (void*)i)) != 0) {
                 die("pthread_create");
             }
         }
@@ -290,7 +290,8 @@ void *accept_main(void *arg) {
     struct timeval timeout;
     int rv, worker_num, lepfd;
 
-    (void)arg;
+    worker_num = (size_t)arg;
+
     while (!done) {
         FD_ZERO(&readfds);
         FD_SET(listenfd, &readfds);
